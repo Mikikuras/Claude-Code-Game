@@ -1,0 +1,705 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>פלישת חמינאי</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      overflow: hidden;
+      cursor: none;
+    }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<script>
+// ─── CANVAS ───────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('gameCanvas');
+const ctx    = canvas.getContext('2d');
+
+const BASE_W = 800;
+const BASE_H = 600;
+
+function resizeCanvas() {
+  const scale = Math.min(window.innerWidth / BASE_W, window.innerHeight / BASE_H);
+  canvas.width  = BASE_W;
+  canvas.height = BASE_H;
+  canvas.style.width  = (BASE_W * scale) + 'px';
+  canvas.style.height = (BASE_H * scale) + 'px';
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+const PLAYER_SPEED         = 280;
+const PLAYER_WIDTH         = 40;
+const PLAYER_HEIGHT        = 30;
+
+const BULLET_SPEED         = 500;
+const ENEMY_BULLET_SPEED   = 200;
+
+const GRID_COLS            = 8;
+const GRID_ROWS            = 4;
+const ENEMY_W              = 44;
+const ENEMY_H              = 66;
+const ENEMY_PAD_X          = 20;
+const ENEMY_PAD_Y          = 16;
+const ENEMY_SCORE          = 100;
+
+const GRID_MOVE_SPEED_BASE = 40;
+const GRID_STEP_DOWN       = 24;
+const SHOOT_INTERVAL_BASE  = 1200;
+const SHOOT_INTERVAL_MIN   = 300;
+
+const STAR_COUNT           = 120;
+const PARTICLE_COUNT       = 18;
+const MAX_WAVES            = 5;
+
+// ─── DIFFICULTY ───────────────────────────────────────────────────────────────
+const DIFFICULTIES = [
+  { label: 'שב בבית',   sub: 'קל',     speedMul: 0.65, shootMul: 1.9, lives: 4, maxBullets: 4 },
+  { label: 'חייל',      sub: 'בינוני', speedMul: 1.0,  shootMul: 1.0, lives: 3, maxBullets: 3 },
+  { label: 'אין רחמים', sub: 'קשה',    speedMul: 1.45, shootMul: 0.5, lives: 2, maxBullets: 2 },
+];
+let diffIdx = 1;
+
+// ─── ASSETS ───────────────────────────────────────────────────────────────────
+const assets = {};
+function loadImage(key, src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload  = () => { assets[key] = img; resolve(); };
+    img.onerror = () => reject(new Error('לא ניתן לטעון: ' + src));
+    img.src = src;
+  });
+}
+function loadAllAssets() {
+  return Promise.all([loadImage('enemy', 'Khaminai-no-bg.png')]);
+}
+
+// ─── AUDIO ────────────────────────────────────────────────────────────────────
+let audioCtx = null;
+function getAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
+}
+
+function playShoot() {
+  try {
+    const ac = getAudio(), osc = ac.createOscillator(), g = ac.createGain();
+    osc.connect(g); g.connect(ac.destination);
+    osc.type = 'square';
+    osc.frequency.setValueAtTime(880, ac.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(440, ac.currentTime + 0.08);
+    g.gain.setValueAtTime(0.12, ac.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.08);
+    osc.start(); osc.stop(ac.currentTime + 0.08);
+  } catch(e) {}
+}
+
+function playExplosion() {
+  try {
+    const ac = getAudio();
+    const buf = ac.createBuffer(1, ac.sampleRate * 0.3, ac.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    const src = ac.createBufferSource(), g = ac.createGain(), f = ac.createBiquadFilter();
+    src.buffer = buf; f.type = 'bandpass';
+    f.frequency.setValueAtTime(400, ac.currentTime);
+    f.frequency.exponentialRampToValueAtTime(80, ac.currentTime + 0.3);
+    src.connect(f); f.connect(g); g.connect(ac.destination);
+    g.gain.setValueAtTime(0.4, ac.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.3);
+    src.start(); src.stop(ac.currentTime + 0.3);
+  } catch(e) {}
+}
+
+function playPlayerHit() {
+  try {
+    const ac = getAudio(), osc = ac.createOscillator(), g = ac.createGain();
+    osc.connect(g); g.connect(ac.destination);
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(200, ac.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(80, ac.currentTime + 0.25);
+    g.gain.setValueAtTime(0.35, ac.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.25);
+    osc.start(); osc.stop(ac.currentTime + 0.25);
+  } catch(e) {}
+}
+
+function playWaveClear() {
+  try {
+    const ac = getAudio();
+    [523, 659, 784, 1046].forEach((freq, i) => {
+      const osc = ac.createOscillator(), g = ac.createGain();
+      osc.connect(g); g.connect(ac.destination);
+      osc.type = 'sine'; osc.frequency.value = freq;
+      const t = ac.currentTime + i * 0.12;
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(0.25, t + 0.05);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+      osc.start(t); osc.stop(t + 0.2);
+    });
+  } catch(e) {}
+}
+
+function playGameOver() {
+  try {
+    const ac = getAudio();
+    [440, 330, 220, 165].forEach((freq, i) => {
+      const osc = ac.createOscillator(), g = ac.createGain();
+      osc.connect(g); g.connect(ac.destination);
+      osc.type = 'sawtooth'; osc.frequency.value = freq;
+      const t = ac.currentTime + i * 0.18;
+      g.gain.setValueAtTime(0.2, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+      osc.start(t); osc.stop(t + 0.3);
+    });
+  } catch(e) {}
+}
+
+// ─── STATE ────────────────────────────────────────────────────────────────────
+let gameState  = 'LOADING';
+let stateTimer = 0;
+function setState(s) { gameState = s; stateTimer = 0; }
+
+// ─── INPUT ────────────────────────────────────────────────────────────────────
+const keys       = {};
+let shootPressed = false;
+
+document.addEventListener('keydown', (e) => {
+  keys[e.code] = true;
+
+  if (gameState === 'START') {
+    if (e.code === 'ArrowLeft')  { diffIdx = (diffIdx + 1) % 3;     e.preventDefault(); }
+    if (e.code === 'ArrowRight') { diffIdx = (diffIdx + 2) % 3;     e.preventDefault(); }
+  }
+
+  if (e.code === 'Space') {
+    e.preventDefault();
+    shootPressed = true;
+    if (gameState === 'START' || gameState === 'GAMEOVER' || gameState === 'WIN') {
+      initGame();
+      setState('PLAYING');
+    }
+  }
+});
+document.addEventListener('keyup', (e) => { keys[e.code] = false; });
+
+// Mouse click on difficulty boxes
+canvas.addEventListener('click', (e) => {
+  if (gameState !== 'START') return;
+  const rect  = canvas.getBoundingClientRect();
+  const cx    = (e.clientX - rect.left) * (BASE_W / rect.width);
+  const cy    = (e.clientY - rect.top)  * (BASE_H / rect.height);
+  const boxW  = 155, boxH = 78, gap = 14;
+  const totalW = 3 * boxW + 2 * gap;
+  const bx0   = (BASE_W - totalW) / 2;
+  const by    = 328;
+  for (let i = 0; i < 3; i++) {
+    const bx = bx0 + i * (boxW + gap);
+    if (cx >= bx && cx <= bx + boxW && cy >= by && cy <= by + boxH) {
+      diffIdx = i;
+      break;
+    }
+  }
+});
+
+// ─── STARS ────────────────────────────────────────────────────────────────────
+class Star {
+  constructor(rand) {
+    this.x = Math.random() * BASE_W;
+    this.y = rand ? Math.random() * BASE_H : 0;
+    this.speed = 20 + Math.random() * 60;
+    this.r     = 0.5 + Math.random() * 1.5;
+    this.alpha = 0.3 + Math.random() * 0.7;
+  }
+  reset() { this.x = Math.random() * BASE_W; this.y = 0; this.speed = 20 + Math.random() * 60; }
+  update(dt) { this.y += this.speed * dt; if (this.y > BASE_H + 5) this.reset(); }
+  draw() {
+    ctx.save(); ctx.globalAlpha = this.alpha; ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+}
+const stars = Array.from({ length: STAR_COUNT }, (_, i) => new Star(i < STAR_COUNT));
+
+// ─── PARTICLES ────────────────────────────────────────────────────────────────
+class Particle {
+  constructor(x, y) {
+    const a = Math.random() * Math.PI * 2, sp = 60 + Math.random() * 180;
+    this.x = x; this.y = y; this.vx = Math.cos(a) * sp; this.vy = Math.sin(a) * sp;
+    this.life = this.maxLife = 0.5 + Math.random() * 0.5;
+    this.r = 2 + Math.random() * 4;
+    this.color = `hsl(${20 + Math.random() * 40},100%,60%)`;
+    this.dead = false;
+  }
+  update(dt) { this.x += this.vx*dt; this.y += this.vy*dt; this.vy += 120*dt; this.life -= dt; if (this.life<=0) this.dead=true; }
+  draw() {
+    const a = Math.max(0, this.life / this.maxLife);
+    ctx.save(); ctx.globalAlpha = a; ctx.fillStyle = this.color; ctx.shadowColor = this.color; ctx.shadowBlur = 6;
+    ctx.beginPath(); ctx.arc(this.x, this.y, this.r * a, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+  }
+}
+function spawnExplosion(x, y) { for (let i = 0; i < PARTICLE_COUNT; i++) particles.push(new Particle(x, y)); }
+
+// ─── BULLET ───────────────────────────────────────────────────────────────────
+class Bullet {
+  constructor(x, y, vx, vy, color) {
+    this.x=x; this.y=y; this.vx=vx; this.vy=vy; this.color=color; this.w=3; this.h=12; this.dead=false;
+  }
+  update(dt) { this.x+=this.vx*dt; this.y+=this.vy*dt; if(this.y<-20||this.y>BASE_H+20) this.dead=true; }
+  draw() {
+    ctx.save(); ctx.fillStyle=this.color; ctx.shadowColor=this.color; ctx.shadowBlur=8;
+    ctx.fillRect(this.x-this.w/2, this.y-this.h/2, this.w, this.h); ctx.restore();
+  }
+  hits(t) { return Math.abs(this.x-t.x)<(this.w/2+t.w/2) && Math.abs(this.y-t.y)<(this.h/2+t.h/2); }
+}
+
+// ─── ENEMY ────────────────────────────────────────────────────────────────────
+class Enemy {
+  constructor(col, row) { this.col=col; this.row=row; this.alive=true; this.bobPhase=Math.random()*Math.PI*2; }
+  draw(x, y, t) {
+    if (!this.alive) return;
+    const bobY = Math.sin(this.bobPhase + t*1.5) * 3;
+    const pulse = 1 + Math.sin(this.bobPhase + t*2.0) * 0.04;
+    ctx.save(); ctx.translate(x, y + bobY); ctx.scale(pulse, pulse);
+    ctx.drawImage(assets.enemy, -ENEMY_W/2, -ENEMY_H/2, ENEMY_W, ENEMY_H);
+    ctx.restore();
+  }
+}
+
+// ─── ENEMY GRID ───────────────────────────────────────────────────────────────
+class EnemyGrid {
+  constructor(wave, diff) {
+    this.wave      = wave;
+    this.diff      = diff;
+    this.enemies   = [];
+    this.offsetX   = 60;
+    this.offsetY   = 80;
+    this.direction = 1;
+    this.baseMoveSpeed = (GRID_MOVE_SPEED_BASE + (wave-1)*15) * diff.speedMul;
+    this.moveSpeed     = this.baseMoveSpeed;
+    this.shootTimer    = 0;
+    this.shootInterval = Math.max(
+      SHOOT_INTERVAL_MIN,
+      SHOOT_INTERVAL_BASE * diff.shootMul - (wave-1)*150
+    ) / 1000;
+    for (let r=0; r<GRID_ROWS; r++)
+      for (let c=0; c<GRID_COLS; c++)
+        this.enemies.push(new Enemy(c, r));
+  }
+  get aliveEnemies() { return this.enemies.filter(e => e.alive); }
+  get totalWidth()   { return GRID_COLS*(ENEMY_W+ENEMY_PAD_X)-ENEMY_PAD_X; }
+  get rightEdge()    { return this.offsetX + this.totalWidth; }
+  enemyPos(col, row) {
+    return {
+      x: this.offsetX + col*(ENEMY_W+ENEMY_PAD_X) + ENEMY_W/2,
+      y: this.offsetY + row*(ENEMY_H+ENEMY_PAD_Y) + ENEMY_H/2,
+    };
+  }
+  update(dt) {
+    this.offsetX += this.direction * this.moveSpeed * dt;
+    const margin = 10;
+    if (this.direction===1 && this.rightEdge>=BASE_W-margin) { this.direction=-1; this.offsetY+=GRID_STEP_DOWN; }
+    else if (this.direction===-1 && this.offsetX<=margin)    { this.direction=1;  this.offsetY+=GRID_STEP_DOWN; }
+
+    const ratio = 1 - this.aliveEnemies.length / (GRID_ROWS*GRID_COLS);
+    this.moveSpeed = this.baseMoveSpeed * (1 + ratio*1.5);
+
+    this.shootTimer -= dt;
+    if (this.shootTimer <= 0) {
+      this.shootTimer = this.shootInterval;
+      const living = this.aliveEnemies;
+      if (living.length) {
+        const s = living[Math.floor(Math.random()*living.length)];
+        const p = this.enemyPos(s.col, s.row);
+        enemyBullets.push(new Bullet(p.x, p.y, 0, ENEMY_BULLET_SPEED, '#ff4444'));
+      }
+    }
+  }
+  draw(t) {
+    for (const e of this.enemies) {
+      if (!e.alive) continue;
+      const p = this.enemyPos(e.col, e.row);
+      e.draw(p.x, p.y, t);
+    }
+  }
+  hasReachedBottom(playerY) {
+    for (const e of this.aliveEnemies) {
+      const p = this.enemyPos(e.col, e.row);
+      if (p.y + ENEMY_H/2 >= playerY - 20) return true;
+    }
+    return false;
+  }
+}
+
+// ─── PLAYER ───────────────────────────────────────────────────────────────────
+class Player {
+  constructor(lives) {
+    this.x=BASE_W/2; this.y=BASE_H-50; this.w=PLAYER_WIDTH; this.h=PLAYER_HEIGHT;
+    this.lives=lives; this.invincible=false; this.invincibleTimer=0; this.shootCooldown=0;
+  }
+  update(dt) {
+    if (keys['ArrowLeft']  || keys['KeyA']) this.x -= PLAYER_SPEED*dt;
+    if (keys['ArrowRight'] || keys['KeyD']) this.x += PLAYER_SPEED*dt;
+    this.x = Math.max(this.w/2, Math.min(BASE_W-this.w/2, this.x));
+    if (this.shootCooldown>0) this.shootCooldown-=dt;
+    if (this.invincible) { this.invincibleTimer-=dt; if(this.invincibleTimer<=0) this.invincible=false; }
+  }
+  draw() {
+    if (this.invincible && Math.floor(Date.now()/80)%2===0) return;
+    ctx.save(); ctx.translate(this.x, this.y);
+    // engine glow
+    ctx.fillStyle='#ff6600'; ctx.shadowColor='#ff6600'; ctx.shadowBlur=12;
+    ctx.beginPath(); ctx.ellipse(0, this.h/2+4+Math.sin(Date.now()/60)*3, 5, 9, 0, 0, Math.PI*2); ctx.fill();
+    // body
+    ctx.shadowBlur=0; ctx.fillStyle='#00e5ff'; ctx.shadowColor='#00e5ff'; ctx.shadowBlur=10;
+    ctx.beginPath();
+    ctx.moveTo(0,-this.h/2); ctx.lineTo(-this.w/2,this.h/2); ctx.lineTo(-this.w/6,this.h/4);
+    ctx.lineTo(0,this.h/3);  ctx.lineTo(this.w/6,this.h/4);  ctx.lineTo(this.w/2,this.h/2);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  hit() {
+    if (this.invincible) return false;
+    this.lives--; this.invincible=true; this.invincibleTimer=2.5; return true;
+  }
+}
+
+// ─── SCREEN FLASH ─────────────────────────────────────────────────────────────
+let screenFlash = 0;
+function updateScreenFlash(dt) { if (screenFlash>0) screenFlash-=dt; }
+function drawScreenFlash() {
+  if (screenFlash<=0) return;
+  const a = Math.min(1, screenFlash/0.3)*0.5;
+  ctx.save(); ctx.fillStyle=`rgba(255,60,60,${a})`; ctx.fillRect(0,0,BASE_W,BASE_H); ctx.restore();
+}
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+function hebrewFont(size, weight='bold') { return `${weight} ${size}px Arial, 'Helvetica Neue', sans-serif`; }
+
+function drawMiniShip(x, y) {
+  ctx.save(); ctx.translate(x,y);
+  ctx.fillStyle='#00e5ff'; ctx.shadowColor='#00e5ff'; ctx.shadowBlur=6;
+  ctx.beginPath(); ctx.moveTo(0,-8); ctx.lineTo(-7,8); ctx.lineTo(0,4); ctx.lineTo(7,8); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+// ─── HUD ──────────────────────────────────────────────────────────────────────
+function drawHUD() {
+  ctx.save();
+  ctx.direction = 'rtl';
+
+  // ניקוד (score) — top left
+  ctx.fillStyle='#fff'; ctx.font='bold 18px monospace'; ctx.textAlign='left';
+  ctx.fillText(`ניקוד: ${score}`, 12, 28);
+
+  // שיא (high score) — top center
+  ctx.textAlign='center'; ctx.fillStyle='#ffdd00';
+  ctx.fillText(`שיא: ${highScore}`, BASE_W/2, 28);
+
+  // גל (wave) — below center
+  ctx.fillStyle='#aaaaff'; ctx.font='bold 14px monospace';
+  ctx.fillText(`גל ${wave}`, BASE_W/2, 50);
+
+  // חיים (lives) — top right as ship icons
+  for (let i=0; i<player.lives; i++) drawMiniShip(BASE_W-20-i*22, 20);
+
+  ctx.restore();
+}
+
+// ─── START SCREEN ─────────────────────────────────────────────────────────────
+function drawStartScreen() {
+  ctx.fillStyle = 'rgba(0,0,0,0.78)';
+  ctx.fillRect(0, 0, BASE_W, BASE_H);
+  ctx.direction = 'rtl';
+
+  // כותרת
+  ctx.textAlign = 'center';
+  ctx.font      = hebrewFont(50);
+  ctx.fillStyle = '#ffdd00';
+  ctx.shadowColor = '#ffaa00'; ctx.shadowBlur = 22;
+  ctx.fillText('פלישת חמינאי', BASE_W/2, 78);
+  ctx.shadowBlur = 0;
+
+  // תת-כותרת
+  ctx.font      = hebrewFont(18);
+  ctx.fillStyle = '#ff9900';
+  ctx.fillText('עצור את המנהיג המטורף לפני שיגיע אליך!', BASE_W/2, 106);
+
+  // תמונת אויב
+  if (assets.enemy) ctx.drawImage(assets.enemy, BASE_W/2 - 48, 118, 96, 144);
+
+  // כותרת בחירת קושי
+  ctx.font      = hebrewFont(20);
+  ctx.fillStyle = '#ccccff';
+  ctx.fillText('בחר רמת קושי:', BASE_W/2, 318);
+
+  // קופסאות קושי
+  const boxW = 155, boxH = 78, gap = 14;
+  const totalW = 3*boxW + 2*gap;
+  const bx0 = (BASE_W - totalW) / 2;
+  const by  = 328;
+
+  const diffColors = ['#00cc66', '#ffaa00', '#ff3333'];
+
+  for (let i = 0; i < 3; i++) {
+    const bx     = bx0 + i*(boxW+gap);
+    const d      = DIFFICULTIES[i];
+    const sel    = i === diffIdx;
+    const col    = diffColors[i];
+
+    // רקע קופסה
+    ctx.fillStyle = sel ? `${col}28` : 'rgba(255,255,255,0.04)';
+    ctx.beginPath();
+    ctx.roundRect(bx, by, boxW, boxH, 10);
+    ctx.fill();
+
+    // מסגרת
+    ctx.strokeStyle = sel ? col : 'rgba(255,255,255,0.18)';
+    ctx.lineWidth   = sel ? 2.5 : 1;
+    ctx.beginPath();
+    ctx.roundRect(bx, by, boxW, boxH, 10);
+    ctx.stroke();
+
+    // שם רמה
+    ctx.fillStyle   = sel ? col : '#aaa';
+    ctx.font        = hebrewFont(22);
+    ctx.textAlign   = 'center';
+    if (sel) { ctx.shadowColor = col; ctx.shadowBlur = 10; }
+    ctx.fillText(d.label, bx + boxW/2, by + 34);
+    ctx.shadowBlur = 0;
+
+    // תת-טקסט
+    ctx.fillStyle = sel ? '#fff' : '#666';
+    ctx.font      = hebrewFont(14, 'normal');
+    ctx.fillText(d.sub, bx + boxW/2, by + 56);
+
+    // חיים ❤
+    ctx.fillStyle = sel ? '#ff6688' : '#553344';
+    ctx.font      = '12px Arial, sans-serif';
+    const heartsText = '❤'.repeat(d.lives);
+    ctx.fillText(heartsText, bx + boxW/2, by + 72);
+  }
+
+  // חצים
+  ctx.fillStyle = 'rgba(255,255,255,0.35)';
+  ctx.font      = '20px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('◄  ►', BASE_W/2, by + boxH + 22);
+
+  // כפתור התחלה
+  ctx.font        = hebrewFont(24);
+  ctx.fillStyle   = '#fff';
+  ctx.shadowColor = '#00e5ff'; ctx.shadowBlur = 10;
+  ctx.fillText('לחץ רווח להתחיל', BASE_W/2, by + boxH + 52);
+  ctx.shadowBlur = 0;
+
+  // הוראות שליטה
+  ctx.font      = hebrewFont(14, 'normal');
+  ctx.fillStyle = '#888';
+  ctx.fillText('חצים / WASD לתנועה  |  רווח לירייה', BASE_W/2, by + boxH + 78);
+
+  ctx.direction = 'ltr';
+}
+
+// ─── GAME OVER SCREEN ─────────────────────────────────────────────────────────
+function drawGameOverScreen() {
+  ctx.fillStyle = 'rgba(0,0,0,0.84)';
+  ctx.fillRect(0, 0, BASE_W, BASE_H);
+  ctx.direction = 'rtl';
+  ctx.textAlign = 'center';
+
+  ctx.font        = hebrewFont(60);
+  ctx.fillStyle   = '#ff4444';
+  ctx.shadowColor = '#ff0000'; ctx.shadowBlur = 22;
+  ctx.fillText('נפלת!', BASE_W/2, 200);
+  ctx.shadowBlur = 0;
+
+  ctx.font      = hebrewFont(22);
+  ctx.fillStyle = '#aaa';
+  ctx.fillText(`רמת קושי: ${DIFFICULTIES[diffIdx].label}`, BASE_W/2, 245);
+
+  ctx.font      = 'bold 26px monospace';
+  ctx.fillStyle = '#fff';
+  ctx.fillText(`ניקוד: ${score}`, BASE_W/2, 290);
+
+  if (score > 0 && score >= highScore) {
+    ctx.font        = hebrewFont(22);
+    ctx.fillStyle   = '#ffdd00';
+    ctx.shadowColor = '#ffaa00'; ctx.shadowBlur = 10;
+    ctx.fillText('שיא חדש! 🔥', BASE_W/2, 330);
+    ctx.shadowBlur = 0;
+  }
+
+  ctx.font      = hebrewFont(20);
+  ctx.fillStyle = '#fff';
+  ctx.fillText('לחץ רווח לנסות שוב', BASE_W/2, 385);
+
+  ctx.direction = 'ltr';
+}
+
+// ─── WIN SCREEN ───────────────────────────────────────────────────────────────
+function drawWinScreen() {
+  ctx.fillStyle = 'rgba(0,0,10,0.87)';
+  ctx.fillRect(0, 0, BASE_W, BASE_H);
+  ctx.direction = 'rtl';
+  ctx.textAlign = 'center';
+
+  ctx.font        = hebrewFont(58);
+  ctx.fillStyle   = '#00ff88';
+  ctx.shadowColor = '#00ff88'; ctx.shadowBlur = 22;
+  ctx.fillText('ניצחת!', BASE_W/2, 195);
+  ctx.shadowBlur = 0;
+
+  ctx.font      = hebrewFont(20);
+  ctx.fillStyle = '#aaffcc';
+  ctx.fillText('חיסלת את כל הכמינייסטים!', BASE_W/2, 240);
+
+  ctx.font      = 'bold 22px monospace';
+  ctx.fillStyle = '#fff';
+  ctx.fillText(`גלים שרדת: ${wave}`, BASE_W/2, 285);
+  ctx.fillText(`ניקוד סופי: ${score}`, BASE_W/2, 318);
+
+  if (score > 0 && score >= highScore) {
+    ctx.font        = hebrewFont(20);
+    ctx.fillStyle   = '#ffdd00';
+    ctx.shadowColor = '#ffaa00'; ctx.shadowBlur = 10;
+    ctx.fillText('שיא חדש! 🔥', BASE_W/2, 355);
+    ctx.shadowBlur = 0;
+  }
+
+  ctx.font      = hebrewFont(20);
+  ctx.fillStyle = '#fff';
+  ctx.fillText('לחץ רווח לנסות שוב', BASE_W/2, 408);
+
+  ctx.direction = 'ltr';
+}
+
+// ─── COLLISION ────────────────────────────────────────────────────────────────
+function checkCollisions() {
+  let gained = 0;
+  for (const b of playerBullets) {
+    if (b.dead) continue;
+    for (const e of grid.enemies) {
+      if (!e.alive) continue;
+      const p = grid.enemyPos(e.col, e.row);
+      if (b.hits({ x:p.x, y:p.y, w:ENEMY_W, h:ENEMY_H })) {
+        b.dead=true; e.alive=false; gained+=ENEMY_SCORE;
+        spawnExplosion(p.x, p.y); playExplosion(); break;
+      }
+    }
+  }
+  const ph = { x:player.x, y:player.y, w:player.w*0.7, h:player.h*0.7 };
+  for (const b of enemyBullets) {
+    if (b.dead) continue;
+    if (b.hits(ph)) {
+      b.dead=true;
+      if (player.hit()) { screenFlash=0.5; spawnExplosion(player.x, player.y); playPlayerHit(); }
+    }
+  }
+  if (grid.hasReachedBottom(player.y)) player.lives=0;
+  return gained;
+}
+
+// ─── GAME VARIABLES ───────────────────────────────────────────────────────────
+let player=null, grid=null;
+let playerBullets=[], enemyBullets=[], particles=[];
+let score=0, highScore=0, wave=1;
+
+function initGame() {
+  const diff    = DIFFICULTIES[diffIdx];
+  player        = new Player(diff.lives);
+  wave          = 1;
+  score         = 0;
+  playerBullets = []; enemyBullets = []; particles = [];
+  grid          = new EnemyGrid(wave, diff);
+  screenFlash   = 0;
+}
+
+function startNextWave() {
+  wave++;
+  if (wave > MAX_WAVES) { playWaveClear(); setState('WIN'); return; }
+  playWaveClear();
+  playerBullets=[]; enemyBullets=[]; particles=[];
+  grid = new EnemyGrid(wave, DIFFICULTIES[diffIdx]);
+}
+
+// ─── GAME LOOP ────────────────────────────────────────────────────────────────
+let lastTime=0, t=0;
+
+function gameLoop(timestamp) {
+  const dt = Math.min((timestamp - lastTime)/1000, 0.05);
+  lastTime=timestamp; t+=dt;
+
+  stars.forEach(s => s.update(dt));
+  updateScreenFlash(dt);
+
+  if (gameState === 'PLAYING') {
+    player.update(dt);
+
+    const diff = DIFFICULTIES[diffIdx];
+    if (shootPressed && player.shootCooldown<=0 &&
+        playerBullets.filter(b=>!b.dead).length < diff.maxBullets) {
+      playerBullets.push(new Bullet(player.x, player.y-player.h/2, 0, -BULLET_SPEED, '#00ffff'));
+      player.shootCooldown=0.15;
+      playShoot();
+    }
+
+    playerBullets.forEach(b=>b.update(dt)); enemyBullets.forEach(b=>b.update(dt));
+    playerBullets=playerBullets.filter(b=>!b.dead); enemyBullets=enemyBullets.filter(b=>!b.dead);
+
+    grid.update(dt);
+
+    score += checkCollisions();
+    if (score > highScore) highScore = score;
+
+    particles.forEach(p=>p.update(dt)); particles=particles.filter(p=>!p.dead);
+
+    if (player.lives <= 0) { screenFlash=0.8; playGameOver(); setState('GAMEOVER'); }
+    if (grid.aliveEnemies.length === 0) startNextWave();
+  }
+
+  shootPressed = false;
+
+  // ─── RENDER ─────────────────────────────────────────────────────────────────
+  ctx.fillStyle='#06060f'; ctx.fillRect(0,0,BASE_W,BASE_H);
+  stars.forEach(s=>s.draw());
+
+  if (gameState==='START') {
+    drawStartScreen();
+  } else if (gameState==='GAMEOVER') {
+    grid.draw(t); playerBullets.forEach(b=>b.draw()); enemyBullets.forEach(b=>b.draw());
+    particles.forEach(p=>p.draw()); drawGameOverScreen();
+  } else if (gameState==='WIN') {
+    drawWinScreen();
+  } else if (gameState==='PLAYING') {
+    grid.draw(t); player.draw();
+    playerBullets.forEach(b=>b.draw()); enemyBullets.forEach(b=>b.draw());
+    particles.forEach(p=>p.draw()); drawScreenFlash(); drawHUD();
+  }
+
+  requestAnimationFrame(gameLoop);
+}
+
+// ─── BOOTSTRAP ────────────────────────────────────────────────────────────────
+loadAllAssets()
+  .then(() => { setState('START'); lastTime=performance.now(); requestAnimationFrame(gameLoop); })
+  .catch(err => {
+    ctx.fillStyle='#ff4444'; ctx.font='18px Arial, sans-serif'; ctx.textAlign='center'; ctx.direction='rtl';
+    ctx.fillText('שגיאה בטעינת קבצים: ' + err.message, BASE_W/2, BASE_H/2-20);
+    ctx.fillStyle='#aaa'; ctx.font='14px Arial, sans-serif';
+    ctx.fillText('וודא ש-Khaminai-no-bg.png נמצא באותה תיקיה', BASE_W/2, BASE_H/2+10);
+  });
+</script>
+</body>
+</html>
